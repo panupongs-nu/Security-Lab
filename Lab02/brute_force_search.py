@@ -2,9 +2,9 @@ import hashlib
 import itertools
 import time
 import multiprocessing as mp
-import os
 from tqdm import tqdm
-import random
+from datetime import datetime
+import os
 
 def hash_match(candidate, target_hashes, hash_algorithm):
     """Hash a candidate and check if it matches any target hashes."""
@@ -19,94 +19,116 @@ def hash_match(candidate, target_hashes, hash_algorithm):
     
     return candidate_hash, candidate_hash in target_hashes
 
-def worker(worker_id, charset, length, chunk_start, chunk_end, target_hashes, hash_algorithm, result_queue, progress_queue, base_batch_size, start_time):
-    """Worker function that processes a chunk of the search space with staggered progress reporting."""
+def worker(worker_id, charset, length, chunk_start, chunk_end, target_hashes, hash_algorithm, result_queue, progress_queue, start_time, log_file, progress_report_interval, stop_event):
+    """Worker function that processes a chunk of the search space, checking for a stop signal."""
     total_combinations = chunk_end - chunk_start
-    progress = 0
+    stop_check_interval = 10000
 
-    # Create a staggered batch size for this worker based on worker_id to avoid reporting at the same time
-    stagger_factor = random.uniform(0.8, 1.2)  # Random factor to stagger reporting
-    batch_size = int(base_batch_size * stagger_factor)
+    candidate_space = itertools.product(charset, repeat=length)
+    for _ in range(chunk_start):
+        next(candidate_space)
 
-    # Precompute the range of candidates for this worker
-    for index in range(chunk_start, chunk_end):
-        # Generate candidate using modular arithmetic to avoid the overhead of itertools.islice
-        candidate = ''.join(charset[(index // len(charset) ** i) % len(charset)] for i in range(length))
-        
-        # Check if the candidate's hash matches any target
+    # Log the time the worker started processing
+    with open(log_file, 'a') as log:
+        start_timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        log.write(f"Worker {worker_id} started processing at {start_timestamp}.\n")
+
+    for index, candidate_tuple in enumerate(itertools.islice(candidate_space, chunk_end - chunk_start)):
+        # Check the stop signal only after every stop_check_interval candidates
+        if index % stop_check_interval == 0 and stop_event.is_set():
+            with open(log_file, 'a') as log:
+                log.write(f"Worker {worker_id} received stop signal and is stopping.\n")
+            break
+
+        candidate = ''.join(candidate_tuple)
         candidate_hash, is_match = hash_match(candidate, target_hashes, hash_algorithm)
+
         if is_match:
-            elapsed_time = time.time() - start_time  # Calculate elapsed time for the found pre-image
+            elapsed_time = time.time() - start_time
             result_queue.put((candidate_hash, candidate, elapsed_time))
-            progress_queue.put((worker_id, 1, total_combinations))  # Update progress immediately after finding pre-image
+            progress_queue.put((worker_id, 1, total_combinations))
 
-        # Update progress after every staggered batch size
-        progress += 1
-        if progress % batch_size == 0:
-            progress_queue.put((worker_id, batch_size, total_combinations))  # Correct batch size added
+        if index % progress_report_interval == 0:
+            progress_queue.put((worker_id, progress_report_interval, total_combinations))
 
-def main_process(num_workers, charset, length, target_hashes, hash_algorithm, base_batch_size, chunk_size, output_file):
+    with open(log_file, 'a') as log:
+        end_timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        log.write(f"Worker {worker_id} finished processing at {end_timestamp}.\n")
+
+def main_process(num_workers, charset, length, target_hashes, hash_algorithm, chunk_size, output_file, log_file="worker_log.txt", hash_file=""):
     """Main process to coordinate workers and manage progress."""
     manager = mp.Manager()
     result_queue = manager.Queue()
     progress_queue = manager.Queue()
 
-    # Determine the total number of combinations
     total_combinations = len(charset) ** length
+    # Set the maximum batch size to 2,000,000
+    batch_size = min(max(int(total_combinations * 0.01), 100), 2000000)
+    
+    # Automatically adjust the progress report interval to be proportional to the batch size
+    progress_report_interval = max(batch_size // 20, 10000)  # Use 5% of batch size, with a minimum of 10,000
 
-    # Divide the total search space into chunks for each worker
-    chunks = []
-    for i in range(num_workers):
-        start_index = i * chunk_size
-        end_index = min(start_index + chunk_size, total_combinations)
-        chunks.append((start_index, end_index))
+    stop_event = mp.Event()
 
-    # Start worker processes
+    chunks = [(i * chunk_size, min((i + 1) * chunk_size, total_combinations)) for i in range(num_workers)]
+
     start_time = time.time()
+    with open(log_file, 'a') as log:
+        main_start_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        log.write(f"Main process started at {main_start_time}\n")
+        log.write(f"Hash values file: {hash_file}\n")
+        log.write(f"Configuration: charset = {charset}, length = {length}, algorithm = {hash_algorithm}, batch size = {batch_size}, progress report interval = {progress_report_interval}\n")
+
+    print(f"Using {num_workers} worker processes with batch size {batch_size}, charset {charset}, length {length}, and algorithm {hash_algorithm}")
+
     processes = []
     for worker_id, (start, end) in enumerate(chunks):
-        p = mp.Process(target=worker, args=(worker_id, charset, length, start, end, target_hashes, hash_algorithm, result_queue, progress_queue, base_batch_size, start_time))
+        p = mp.Process(target=worker, args=(worker_id, charset, length, start, end, target_hashes, hash_algorithm, result_queue, progress_queue, start_time, log_file, progress_report_interval, stop_event))
         processes.append(p)
         p.start()
 
-    # Monitor progress from workers
-    overall_progress = 0
-    overall_pbar = tqdm(total=total_combinations, desc="Overall Progress", unit="combination", mininterval=1, position=0, dynamic_ncols=True)
-    found_pre_images = 0
-    found_pbar = tqdm(total=len(target_hashes), desc="Pre-images Found", unit="pre-image", mininterval=1, position=1, dynamic_ncols=True)
+        time.sleep(1)  # Staggered delay before starting the next worker
 
-    # Store the found results to write to the output file
+    overall_pbar = tqdm(total=total_combinations, desc="Overall Progress", unit="combination", mininterval=2, dynamic_ncols=True)
+    found_pbar = tqdm(total=len(target_hashes), desc="Pre-images Found", unit="pre-image", mininterval=2, dynamic_ncols=True)
+
     results = []
+    found_pre_images = 0
 
-    while any(p.is_alive() for p in processes) or not result_queue.empty():
+    while any(p.is_alive() for p in processes) or not result_queue.empty() or not progress_queue.empty():
         try:
-            # Update overall progress based on batch sizes correctly
-            worker_id, progress, total = progress_queue.get(timeout=1)
+            worker_id, progress, total = progress_queue.get(timeout=0.1)
             overall_pbar.update(progress)
         except:
             pass
 
-        # Check the result queue for any found pre-images
         while not result_queue.empty():
-            matches = result_queue.get()
-            if matches:
-                found_pre_images += 1
-                found_pbar.update(1)  # Update the pre-image found progress immediately
-                candidate_hash, candidate, elapsed_time = matches
-                results.append((candidate_hash, candidate, elapsed_time))
+            candidate_hash, candidate, elapsed_time = result_queue.get()
+            found_pbar.update(1)
+            results.append((candidate_hash, candidate, elapsed_time))
+            found_pre_images += 1
 
-    # Wait for all workers to finish
+            if found_pre_images >= len(target_hashes):
+                stop_event.set()  # Signal all workers to stop
+                break
+
     for p in processes:
         p.join()
-    
+
     overall_pbar.close()
     found_pbar.close()
 
-    # Calculate and print the total elapsed time
     total_elapsed_time = time.time() - start_time
+    average_time_per_pre_image = total_elapsed_time / found_pre_images if found_pre_images > 0 else 0
+
+    with open(log_file, 'a') as log:
+        log.write(f"Search completed at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+        log.write(f"Total elapsed time: {total_elapsed_time:.2f} seconds\n")
+        log.write(f"Average time per pre-image: {average_time_per_pre_image:.2f} seconds\n")
+        log.write(f"--------------------------------------------\n")
+
     print(f"\nTotal Elapsed Time: {total_elapsed_time:.2f} seconds")
 
-    # Write the results to the output file
     with open(output_file, 'w') as f_out:
         f_out.write('Target Hash,Pre-image,Elapsed Time (s)\n')
         for candidate_hash, candidate, elapsed_time in results:
@@ -114,94 +136,66 @@ def main_process(num_workers, charset, length, target_hashes, hash_algorithm, ba
 
     return len(results), total_elapsed_time
 
-def get_charset_option():
-    """Helper function to get the charset based on user input."""
-    print("Select the character set to use for generating pre-images:")
-    print("1. Numbers only (0-9)")
-    print("2. Numbers with capital letters (0-9, A-Z)")
-    print("3. Numbers with case-sensitive letters (0-9, a-z, A-Z)")
-    print("4. Alphanumeric with symbols")
-    while True:
-        choice = input("Enter your choice (1-4): ")
-        if choice == '1':
-            return '0123456789'
-        elif choice == '2':
-            return '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ'
-        elif choice == '3':
-            return '0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ'
-        elif choice == '4':
-            return '0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ!@#$%^&*()-_=+[]{}|;:",.<>?/~`'
-        else:
-            print("Invalid choice. Please enter a number between 1 and 4.")
-
-def load_target_hashes(file_path):
-    """Load the target hashes from a file."""
+def load_target_hashes_and_config(file_path):
+    """Load the target hashes and configuration from the file, with error handling for file not found."""
     if not os.path.exists(file_path):
-        print(f"Error: The file {file_path} does not exist.")
-        return set()
+        print(f"Error: The file '{file_path}' was not found. Please check the file path and try again.")
+        return None, None
 
     target_hashes = set()
+    config = {"charset": 1, "algorithm": "MD5", "length": 4}  # Default config
+
     with open(file_path, 'r') as f:
         for line in f:
-            hash_val = line.strip().lower()
-            if hash_val:
-                target_hashes.add(hash_val)
-    return target_hashes
+            if line.startswith("#charset:"):
+                config["charset"] = int(line.split(":")[1].strip())
+            elif line.startswith("#algorithm:"):
+                config["algorithm"] = line.split(":")[1].strip()
+            elif line.startswith("#length:"):
+                config["length"] = int(line.split(":")[1].strip())
+            elif not line.startswith("#"):  # Target hashes
+                hash_val = line.strip().lower()
+                if hash_val:
+                    target_hashes.add(hash_val)
+    return target_hashes, config
+
+def charset_option(charset_id):
+    """Map charset ID to actual charset string."""
+    charset_options = {
+        1: '0123456789',
+        2: '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ',
+        3: '0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ',
+        4: '0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ!@#$%^&*()-_=+[]{}|;:",.<>?/~`'
+    }
+    return charset_options.get(charset_id, '0123456789')  # Default to numbers only
 
 def main():
     print("Brute-force Hash Search Program")
 
-    # Get the number of available CPU cores
+    input_file = input("Enter the path to the file containing target hash values and configuration: ")
+    target_hashes, config = load_target_hashes_and_config(input_file)
+
+    if target_hashes is None or config is None:
+        return  # Exit the program if the file is not found or is invalid
+
+    charset = charset_option(config["charset"])
+    hash_algorithm = config["algorithm"]
+    length = config["length"]
+
     available_cores = mp.cpu_count()
-    print(f"Number of available CPU cores: {available_cores}")
-
-    # Get user inputs for parameters
     num_workers = int(input(f"Enter the number of worker processes to use (1-{available_cores}): "))
-    length = int(input("Enter the length of the pre-image to search for: "))
-    charset = get_charset_option()
-    
-    print("Select the hash algorithm:")
-    print("1. MD5")
-    print("2. SHA-1")
-    print("3. SHA-256")
-    while True:
-        algo_choice = input("Enter the hash algorithm (1-3): ")
-        if algo_choice == '1':
-            hash_algorithm = 'MD5'
-            break
-        elif algo_choice == '2':
-            hash_algorithm = 'SHA-1'
-            break
-        elif algo_choice == '3':
-            hash_algorithm = 'SHA-256'
-            break
-        else:
-            print("Invalid choice, please enter 1, 2, or 3.")
+    log_file = "worker_log.txt"
 
-    # Load target hashes from the user-provided file
-    while True:
-        input_file = input("Enter the path to the file containing target hash values: ")
-        target_hashes = load_target_hashes(input_file)
-        if target_hashes:
-            break
-
-    # Ask for output file to save results
-    output_file = input("Enter the path to the output file to write results (e.g., output.csv): ")
-    if not output_file:
-        output_file = 'output.csv'
-
-    # Total combinations
     total_combinations = len(charset) ** length
-
-    # Set base batch size and chunk size (for dividing tasks)
-    base_batch_size = int(input("Enter the base batch size for progress updates (e.g., 1000): "))
     chunk_size = total_combinations // num_workers
 
-    # Start the brute-force search
-    found_pre_images, total_elapsed_time = main_process(num_workers, charset, length, target_hashes, hash_algorithm, base_batch_size, chunk_size, output_file)
+    output_file = f"output_workers_{num_workers}_charset_{config['charset']}_algo_{hash_algorithm}_length_{length}.csv"
+
+    found_pre_images, total_elapsed_time = main_process(num_workers, charset, length, target_hashes, hash_algorithm, chunk_size, output_file, log_file, input_file)
 
     print(f"Search complete! Total pre-images found: {found_pre_images}")
     print(f"Results written to: {output_file}")
+    print(f"Worker logs can be found in: {log_file}")
 
 if __name__ == "__main__":
     main()
